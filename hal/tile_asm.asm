@@ -128,7 +128,7 @@ draw_tile_fast:
 
     ; Advance to next row
     add     esi, 8              ; Next tile row (8 bytes)
-    add     edi, 256            ; Next screen row (256 bytes)
+    add     edi, 512            ; Next screen row (512 bytes)
     
     pop     ecx                 ; Restore row counter
     dec     ecx

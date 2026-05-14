@@ -303,7 +303,6 @@ static void decode_all_tiles(const u8 *chr) {
 // NES has 2 nametables of 32x30 tiles each
 static u8 dirty_tiles[2][32 * 30];  // 0 = clean, 1 = dirty
 static bool all_tiles_dirty = true; // Force full redraw on first frame
-static int last_scroll_x = 0;       // Track full 0-511 scroll position
 
 // Mark a tile as dirty (called from ppu_mem_write)
 static void mark_tile_dirty(u16 addr) {
@@ -345,9 +344,13 @@ static void clear_dirty_flags() {
 }
 
 // Internal buffer for PPU render
-static u8 internal_buffer[256 * 240];
+static u8 internal_buffer[512 * 240];
 
 u8 *get_ppu_buffer() { return internal_buffer; }
+
+int get_scroll_x() {
+  return (int)ppu.scroll_x + ((ppu.ctrl & 0x01) ? 256 : 0);
+}
 
 // Initialize VGA DAC with NES palette
 static void setup_vga_palette() {
@@ -422,10 +425,10 @@ void ppu_render_frame(u32 *buffer_unused) {
     const u8 *pal_base = &ppu.palette[4 * palette_high];
 
     // Fast path: tile fully on-screen (no clipping needed)
-    if (screen_x >= 0 && screen_x <= 248 && screen_y_base >= 0 &&
+    if (screen_x >= 0 && screen_x <= 504 && screen_y_base >= 0 &&
         screen_y_base <= 232) {
       // Use ASM tile renderer for maximum speed
-      u8 *dest_ptr = &dst[screen_y_base * 256 + screen_x];
+      u8 *dest_ptr = &dst[screen_y_base * 512 + screen_x];
       draw_tile_fast(decoded, dest_ptr, pal_base, bg_color);
     } else {
       // Slow path: clipped tile
@@ -436,82 +439,21 @@ void ppu_render_frame(u32 *buffer_unused) {
 
         for (int px = 0; px < 8; px++) {
           int sx = screen_x + px;
-          if (sx < 0 || sx >= 256)
+          if (sx < 0 || sx >= 512)
             continue;
 
           u8 color_idx = decoded[py * 8 + px];
-          dst[screen_y * 256 + sx] =
+          dst[screen_y * 512 + sx] =
               color_idx ? (pal_base[color_idx] & 0x3F) : bg_color;
         }
       }
     }
   };
 
-  // ============================================
-  // Detect scroll changes - shift buffer and force redraw of new edge
-  // ============================================
-  int current_scroll = scrollX;
-  if (current_scroll != last_scroll_x) {
-    int delta = current_scroll - last_scroll_x;
-    
-    // Handle nametable wrap-around (511 -> 0 or 0 -> 511)
-    if (delta < -256) delta += 512;
-    else if (delta > 256) delta -= 512;
-    
-    last_scroll_x = current_scroll;
-
-    if (!all_tiles_dirty && delta > 0 && delta <= 8) {
-      // Scrolled right. Shift buffer left.
-      for (int y = 32; y < 240; y++) {
-        memmove(&dst[y * 256], &dst[y * 256 + delta], 256 - delta);
-      }
-      
-      // Mark newly exposed right edge tiles as dirty
-      int right_edge_start = current_scroll + 256 - delta;
-      int right_edge_end = current_scroll + 255;
-      
-      int start_tx = right_edge_start / 8;
-      int end_tx = right_edge_end / 8;
-      
-      for (int tx = start_tx; tx <= end_tx; tx++) {
-        int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
-        int local_x = tx & 0x1F;
-        for (int ty = 4; ty < 30; ty++) {
-          dirty_tiles[nt][ty * 32 + local_x] = 1;
-        }
-      }
-    } else if (!all_tiles_dirty && delta < 0 && delta >= -8) {
-      // Scrolled left. Shift buffer right.
-      int shift = -delta;
-      for (int y = 32; y < 240; y++) {
-        memmove(&dst[y * 256 + shift], &dst[y * 256], 256 - shift);
-      }
-      
-      // Mark newly exposed left edge tiles as dirty
-      int left_edge_start = current_scroll;
-      int left_edge_end = current_scroll + shift - 1;
-      
-      int start_tx = left_edge_start / 8;
-      int end_tx = left_edge_end / 8;
-      
-      for (int tx = start_tx; tx <= end_tx; tx++) {
-        int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
-        int local_x = tx & 0x1F;
-        for (int ty = 4; ty < 30; ty++) {
-          dirty_tiles[nt][ty * 32 + local_x] = 1;
-        }
-      }
-    } else {
-      // Scroll delta too large - redraw everything
-      memset(dirty_tiles, 1, sizeof(dirty_tiles));
-      all_tiles_dirty = true;
-    }
-  }
-
   // Pre-fill buffer with background color on full redraw
   u8 bg_color_fill = ppu.palette[0] & 0x3F;
   if (all_tiles_dirty) {
-    memset(dst, bg_color_fill, 256 * 240);
+    memset(dst, bg_color_fill, 512 * 240);
   }
 
   // ============================================
@@ -529,12 +471,9 @@ void ppu_render_frame(u32 *buffer_unused) {
   }
 
   // ============================================
-  // Render Gameplay Area (rows 4-29) - WITH SCROLL
+  // Render Gameplay Area (rows 4-29) - BOTH NAMETABLES
   // ============================================
-  int xMin = scrollX / 8;
-  int xMax = (scrollX + 255) / 8;
-
-  for (int x = xMin; x <= xMax; x++) {
+  for (int x = 0; x < 64; x++) {
     for (int tile_y = 4; tile_y < 30; tile_y++) {
       // Skip clean tiles
       int nt = (x < 32) ? 0 : 1;
@@ -546,30 +485,29 @@ void ppu_render_frame(u32 *buffer_unused) {
       u16 nt_addr;
       if (x < 32) {
         nt_addr = 0x2000 + tile_y * 32 + x;
-      } else if (x < 64) {
-        nt_addr = 0x2400 + tile_y * 32 + (x - 32);
       } else {
-        nt_addr = 0x2000 + tile_y * 32 + (x - 64); // Wrap around
+        nt_addr = 0x2400 + tile_y * 32 + (x - 32);
       }
 
-      // Calculate screen position with scroll offset
-      int screen_x = (x * 8) - scrollX;
-      renderTileAt(nt_addr, screen_x, tile_y * 8);
+      // Draw at absolute coordinate
+      int abs_x = x * 8;
+      renderTileAt(nt_addr, abs_x, tile_y * 8);
     }
   }
 
-  // ============================================
-  // Render Sprites BEHIND Background (priority bit = 1)
-  // ============================================
-  // Lambda to render sprites with optional priority filter
-  auto renderSprites = [&](bool behind_bg) {
-    if (!(ppu.mask & 0x10))
-      return; // Sprites disabled
+  // Clear dirty flags for next frame
+  clear_dirty_flags();
+}
 
-    u16 spr_pattern_base = (ppu.ctrl & 0x08) ? 0x1000 : 0x0000;
+void draw_sprites_to_vram(u8* vram, int start_x, int crop_top) {
+  if (!(ppu.mask & 0x10)) return; // Sprites disabled
 
+  u16 spr_pattern_base = (ppu.ctrl & 0x08) ? 0x1000 : 0x0000;
+  u8 bg_color = ppu.palette[0] & 0x3F;
+  int scrollX = get_scroll_x();
+
+  auto renderSpritesPass = [&](bool behind_bg) {
     for (int i = 63; i >= 0; i--) {
-      // Skip inactive sprites early (before reading other OAM bytes)
       u8 spr_y = ppu.oam[i * 4 + 0];
       if (spr_y >= 0xEF) continue;
 
@@ -577,134 +515,55 @@ void ppu_render_frame(u32 *buffer_unused) {
       u8 attr = ppu.oam[i * 4 + 2];
       u8 spr_x = ppu.oam[i * 4 + 3];
 
-      // Check priority bit - skip if not matching current pass
-      bool has_priority = (attr & 0x20) != 0; // Bit 5 = behind BG
-      if (has_priority != behind_bg)
-        continue;
-
-      // Skip sprites off-screen horizontally
-      if (spr_x >= 0xF9)
-        continue;
-
-      // Sprite Y is 1 scanline early
-      spr_y++;
+      bool has_priority = (attr & 0x20) != 0;
+      if (has_priority != behind_bg) continue;
+      if (spr_x >= 0xF9) continue;
+      spr_y++; // NES sprite Y is 1 scanline early
 
       bool flip_x = (attr & 0x40) != 0;
       bool flip_y = (attr & 0x80) != 0;
       u8 palette_idx = (attr & 0x03);
 
-      // Use pre-decoded tile cache (FAST!)
       int pattern_idx = (spr_pattern_base / 16) + tile_id;
       const u8 *decoded = tile_cache[pattern_idx];
       const u8 *spr_pal = &ppu.palette[0x10 + palette_idx * 4];
-      u8 bg_color = ppu.palette[0] & 0x3F;
 
-      // Fast path: fully on-screen sprite (no clipping)
-      if (spr_x <= 248 && spr_y >= 1 && spr_y <= 232) {
-        for (int row = 0; row < 8; row++) {
-          int yOffset = flip_y ? (7 - row) : row;
-          int screen_y = spr_y + yOffset;
-          u8 *dst_row = &dst[screen_y * 256 + spr_x];
-          const u8 *src_row = &decoded[row * 8];
+      for (int row = 0; row < 8; row++) {
+        int yOffset = flip_y ? (7 - row) : row;
+        int screen_y = spr_y + yOffset;
+        
+        if (screen_y < crop_top || screen_y >= crop_top + 200) continue;
+        int vram_y = screen_y - crop_top;
 
-          for (int col = 0; col < 8; col++) {
-            int xOffset = flip_x ? (7 - col) : col;
-            u8 color_idx = src_row[col];
+        const u8 *src_row = &decoded[row * 8];
 
-            if (color_idx == 0)
-              continue; // Transparent
+        for (int col = 0; col < 8; col++) {
+          int xOffset = flip_x ? (7 - col) : col;
+          int screen_x = spr_x + xOffset;
+          
+          if (screen_x < 0 || screen_x >= 256) continue;
+          
+          u8 color_idx = src_row[col];
+          if (color_idx == 0) continue;
 
-            // For behind-BG sprites: only draw if BG pixel is bg_color
-            if (behind_bg && dst_row[xOffset] != bg_color)
-              continue;
-
-            dst_row[xOffset] = spr_pal[color_idx] & 0x3F;
+          // Priority check using internal buffer
+          if (behind_bg) {
+             int abs_x = screen_x;
+             if (screen_y >= 32) {
+                 abs_x = (screen_x + scrollX) & 0x1FF;
+             }
+             if (internal_buffer[screen_y * 512 + abs_x] != bg_color) continue;
           }
-        }
-      } else {
-        // Slow path: clipped sprite
-        for (int row = 0; row < 8; row++) {
-          int yOffset = flip_y ? (7 - row) : row;
-          int screen_y = spr_y + yOffset;
-          if (screen_y < 0 || screen_y >= 240)
-            continue;
 
-          const u8 *src_row = &decoded[row * 8];
-
-          for (int col = 0; col < 8; col++) {
-            int xOffset = flip_x ? (7 - col) : col;
-            int screen_x = spr_x + xOffset;
-
-            if (screen_x < 0 || screen_x >= 256)
-              continue;
-
-            u8 color_idx = src_row[col];
-            if (color_idx == 0)
-              continue;
-
-            int pixel_idx = screen_y * 256 + screen_x;
-            if (behind_bg && dst[pixel_idx] != bg_color)
-              continue;
-
-            dst[pixel_idx] = spr_pal[color_idx] & 0x3F;
-          }
+          // Write directly to VRAM
+          vram[vram_y * 320 + start_x + screen_x] = spr_pal[color_idx] & 0x3F;
         }
       }
     }
   };
 
-  // First: render behind-BG sprites (they appear behind non-transparent
-  // BG) These only draw where the background pixel is the universal BG
-  // color (palette[0])
-  renderSprites(true);
-
-  // Then: render in-front-of-BG sprites (priority bit = 0)
-  renderSprites(false);
-
-  // Clear dirty flags, then mark tiles under sprites as dirty for NEXT frame.
-  // This ensures the background is restored where sprites were drawn,
-  // preventing ghosting when sprites move to new positions.
-  clear_dirty_flags();
-
-  // Mark tiles under active sprites as dirty for next frame
-  for (int i = 0; i < 64; i++) {
-    u8 sy = ppu.oam[i * 4];
-    if (sy >= 0xEF) continue;
-    u8 sx = ppu.oam[i * 4 + 3];
-    if (sx >= 0xF9) continue;
-    sy++; // NES sprite Y is 1 scanline early
-
-    // Each 8x8 sprite can overlap up to 2x2 tiles
-    int top_ty = sy / 8;
-    int bot_ty = (sy + 7) / 8;
-
-    for (int ty = top_ty; ty <= bot_ty && ty < 30; ty++) {
-      if (ty < 0) continue;
-
-      if (ty < 4) {
-        // Status bar tiles (no scroll)
-        int left_tx = sx / 8;
-        int right_tx = (sx + 7) / 8;
-        for (int tx = left_tx; tx <= right_tx && tx < 32; tx++) {
-          if (tx >= 0) dirty_tiles[0][ty * 32 + tx] = 1;
-        }
-      } else {
-        // Gameplay area tiles (with scroll offset)
-        int abs_left = sx + scrollX;
-        int abs_right = sx + 7 + scrollX;
-        int left_tx = abs_left / 8;
-        int right_tx = abs_right / 8;
-        for (int tx = left_tx; tx <= right_tx; tx++) {
-          int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
-          int local_x = tx & 0x1F;
-          int idx = ty * 32 + local_x;
-          if (idx >= 0 && idx < 32 * 30) {
-            dirty_tiles[nt][idx] = 1;
-          }
-        }
-      }
-    }
-  }
+  renderSpritesPass(true);
+  renderSpritesPass(false);
 }
 
 void video_init() {
