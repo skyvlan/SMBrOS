@@ -1,0 +1,308 @@
+# =============================================================================
+# Makefile.cpp - C++ Build System for SMBrOS
+# =============================================================================
+# Usage: make -f Makefile.cpp [target]
+# Usage: make -f Makefile.cpp SCALE_2X=1 [target]  (for 512x480 scaled mode)
+# Usage: make -f Makefile.cpp OPT_LEVEL=fast [target]
+# Targets: all, clean, run, debug, vhd, run-scaled
+# =============================================================================
+
+# Toolchain
+TOOLCHAIN_DIR = toolchain/bin
+CC      = $(TOOLCHAIN_DIR)/i686-elf-gcc
+CXX     = $(TOOLCHAIN_DIR)/i686-elf-g++
+AS      = nasm
+LD      = $(TOOLCHAIN_DIR)/i686-elf-ld
+OBJCOPY = $(TOOLCHAIN_DIR)/i686-elf-objcopy
+
+# Directories
+BUILD_DIR   = build
+KERNEL_DIR  = kernel
+HAL_DIR     = hal
+SMB_DIR     = smb
+BOOT_DIR    = boot
+
+# Optional: Scale Mode (512x480 with letterboxing)
+# Usage: make -f Makefile.rewrite SCALE_2X=1 all
+SCALE_2X ?= 0
+ifeq ($(SCALE_2X),1)
+  SCALE_FLAGS = -DSCALE_2X
+else
+  SCALE_FLAGS =
+endif
+
+# Optional: Force Mode 13h (320x200) for testing
+# Usage: make -f Makefile.rewrite FORCE_MODE13H=1 all
+FORCE_MODE13H ?= 0
+ifeq ($(FORCE_MODE13H),1)
+  MODE13H_FLAGS = -DFORCE_MODE13H
+  NASM_MODE13H_FLAGS = -DFORCE_MODE13H
+else
+  MODE13H_FLAGS =
+  NASM_MODE13H_FLAGS =
+endif
+
+# Optional: Disable frame limiter (run as fast as possible)
+# Useful for slow CPUs or benchmarking
+# Usage: make -f Makefile.rewrite NO_VSYNC=1 all
+NO_VSYNC ?= 0
+ifeq ($(NO_VSYNC),1)
+  VSYNC_FLAGS = -DNO_VSYNC
+else
+  VSYNC_FLAGS =
+endif
+
+# Optional: Show FPS counter on screen
+# Usage: make -f Makefile.rewrite SHOW_FPS=1 all
+SHOW_FPS ?= 0
+ifeq ($(SHOW_FPS),1)
+  FPS_FLAGS = -DSHOW_FPS
+else
+  FPS_FLAGS =
+endif
+
+# Optional: Text mode benchmark (run game logic, skip rendering)
+# Useful for isolating game logic performance
+# Usage: make -f Makefile.rewrite TEXT_MODE=1 all
+TEXT_MODE ?= 0
+ifeq ($(TEXT_MODE),1)
+  TEXT_FLAGS = -DTEXT_MODE
+  NASM_TEXT_FLAGS = -DTEXT_MODE
+else
+  TEXT_FLAGS =
+  NASM_TEXT_FLAGS =
+endif
+
+# Optional: Experimental PC Speaker APU (Square 2 only)
+# Usage: make -f Makefile.rewrite EXPERIMENTAL_PC_SPEAKER=1 all
+EXPERIMENTAL_PC_SPEAKER ?= 0
+GD5428_OPTIMIZE ?= 0
+
+# Optional: Sound Blaster Support
+# Usage: make -f Makefile.rewrite SB_SUPPORT=1 all
+SB_SUPPORT ?= 0
+SB_BLASTER ?= "A220 I7 D1 H1 P330 T6"
+SB_MODE    ?= MIDI_SYNTH
+
+ifeq ($(SB_SUPPORT),1)
+  SB_FLAGS = -DSB_SUPPORT -DSB_BLASTER='$(SB_BLASTER)' -DSB_MODE_$(SB_MODE)
+else
+  SB_FLAGS =
+endif
+
+ifeq ($(EXPERIMENTAL_PC_SPEAKER),1)
+  PC_SPEAKER_FLAGS = -DEXPERIMENTAL_PC_SPEAKER
+else
+  PC_SPEAKER_FLAGS =
+endif
+
+ifeq ($(GD5428_OPTIMIZE),1)
+  GD5428_FLAGS = -DGD5428_OPTIMIZE
+else
+  GD5428_FLAGS =
+endif
+
+# ==========================================
+# Optimization Level Presets
+# ==========================================
+# Usage: make -f Makefile.rewrite OPT_LEVEL=fast all
+# Options:
+#   default    - Standard (-O2, i386 compat, safe for debugging)
+#   fast       - Speed optimized (-O3, i486+)
+#   small      - Size optimized (-Os, good for cache on old CPUs)
+#   aggressive - Maximum speed (-O3, -mregparm=3, inline everything)
+#   insane     - Size + regparm + section GC (smallest binary)
+#   modern     - For Pentium Pro+ (i686, CMOV, better scheduling)
+#   native     - Uses YOUR machine's CPU (fastest for testing)
+# ==========================================
+OPT_LEVEL ?= default
+
+ifeq ($(OPT_LEVEL),fast)
+  ARCH_FLAGS = -march=i486 -mtune=pentium
+  OPT_FLAGS  = -O2 -fomit-frame-pointer -fno-pic
+  LTO_LDFLAGS =
+else ifeq ($(OPT_LEVEL),small)
+  ARCH_FLAGS = -march=i486 -mtune=pentium
+  OPT_FLAGS  = -Os -fomit-frame-pointer -fno-pic
+  LTO_LDFLAGS =
+else ifeq ($(OPT_LEVEL),aggressive)
+  ARCH_FLAGS = -march=i486 -mtune=pentium
+  OPT_FLAGS  = -O3 -fomit-frame-pointer -fno-pic -mregparm=3 -finline-functions -funroll-loops
+  LTO_LDFLAGS =
+else ifeq ($(OPT_LEVEL),insane)
+  ARCH_FLAGS = -march=i486 -mtune=pentium
+  OPT_FLAGS  = -Os -fomit-frame-pointer -fno-pic -mregparm=3 -ffunction-sections -fdata-sections
+  LTO_LDFLAGS = --gc-sections
+else ifeq ($(OPT_LEVEL),modern)
+  # Modern CPUs (Pentium Pro+, Core, etc.) - Uses CMOV, safe O2
+  ARCH_FLAGS = -march=i686 -mtune=generic
+  OPT_FLAGS  = -O2 -fomit-frame-pointer -fno-pic
+  LTO_LDFLAGS =
+else ifeq ($(OPT_LEVEL),native)
+  # Native: Uses current machine's CPU features (for testing on dev machine)
+  ARCH_FLAGS = -march=native -mtune=native
+  OPT_FLAGS  = -O2 -fomit-frame-pointer -fno-pic
+  LTO_LDFLAGS =
+else
+  # default
+  ARCH_FLAGS = -march=i386 -mtune=i486
+  OPT_FLAGS  = -O2
+  LTO_LDFLAGS =
+endif
+
+# Compiler flags
+CFLAGS      = $(ARCH_FLAGS) -ffreestanding -nostdlib -fno-builtin -Wall -Wextra $(OPT_FLAGS) $(SCALE_FLAGS) $(MODE13H_FLAGS) $(VSYNC_FLAGS) $(FPS_FLAGS) $(TEXT_FLAGS) $(PC_SPEAKER_FLAGS) $(GD5428_FLAGS) $(SB_FLAGS)
+CXXFLAGS    = $(CFLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++17 -Wno-unused-label
+ASFLAGS     = -f elf32
+LDFLAGS     = -T $(KERNEL_DIR)/link.ld -nostdlib -Map $(BUILD_DIR)/kernel.map $(LTO_LDFLAGS)
+
+
+# Source files
+CXX_SRCS    = $(KERNEL_DIR)/kernel_main.cpp \
+              $(HAL_DIR)/video.cpp \
+              $(HAL_DIR)/hal_impl.cpp \
+              $(HAL_DIR)/timing.cpp \
+              $(HAL_DIR)/input.cpp \
+              $(HAL_DIR)/apu.cpp \
+              $(HAL_DIR)/render.cpp \
+              $(SMB_DIR)/SMBEngine.cpp \
+              $(SMB_DIR)/smb_high.cpp \
+              $(SMB_DIR)/smb_data.cpp \
+              $(SMB_DIR)/smb_chr.cpp \
+              $(KERNEL_DIR)/idt.cpp \
+              $(KERNEL_DIR)/memfuncs.cpp
+
+ifeq ($(GD5428_OPTIMIZE),1)
+CXX_SRCS += $(HAL_DIR)/gd5428.cpp
+endif
+ifeq ($(SB_SUPPORT),1)
+CXX_SRCS += $(HAL_DIR)/soundblaster.cpp
+endif
+ASM_SRCS    = $(KERNEL_DIR)/crt0.asm \
+              $(KERNEL_DIR)/irq_stubs.asm \
+              $(HAL_DIR)/tile_asm.asm
+
+# Object files
+# Map source paths to build directory: kernel/foo.cpp -> build/kernel/foo.o
+CXX_OBJS    = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
+ASM_OBJS    = $(patsubst %.asm,$(BUILD_DIR)/%.o,$(ASM_SRCS))
+ALL_OBJS    = $(ASM_OBJS) $(CXX_OBJS)
+
+# Output files
+KERNEL_ELF  = $(BUILD_DIR)/kernel.elf
+KERNEL_BIN  = $(BUILD_DIR)/kernel.bin
+DISK_IMG    = $(BUILD_DIR)/smbros.img
+
+# QEMU settings
+QEMU        = "H:\Program Files\qemu\qemu-system-i386.exe"
+QEMU_IMG    = "H:\Program Files\qemu\qemu-img.exe"
+
+# =============================================================================
+# Targets
+# =============================================================================
+
+.PHONY: all clean run debug dirs vhd
+
+all: $(DISK_IMG)
+	@echo "Build complete: $(DISK_IMG)"
+
+vhd: $(DISK_IMG)
+	@echo "VHD  build/smbros.vhd"
+	$(QEMU_IMG) convert $(DISK_IMG) -O vpc -o subformat=dynamic build/smbros.vhd
+
+dirs:
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+
+clean:
+	@if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+	@echo "Clean complete"
+
+# =============================================================================
+# Build Rules
+# =============================================================================
+
+# Compile C++ files
+# Use -I. to include project root for relative includes
+$(BUILD_DIR)/%.o: %.cpp
+	@echo "CXX  $<"
+	@if not exist $(dir $@) mkdir $(subst /,\,$(dir $@))
+	$(CXX) $(CXXFLAGS) -I. -I$(KERNEL_DIR) -I$(HAL_DIR) -c $< -o $@
+
+# Assemble NASM files
+$(BUILD_DIR)/%.o: %.asm
+	@echo "ASM  $<"
+	@if not exist $(dir $@) mkdir $(subst /,\,$(dir $@))
+	$(AS) $(ASFLAGS) $< -o $@
+
+# Link kernel ELF
+$(KERNEL_ELF): $(ALL_OBJS)
+	@echo "LD   $@"
+	$(LD) $(LDFLAGS) -o $@ $(ALL_OBJS)
+
+# Extract raw binary from ELF
+$(KERNEL_BIN): $(KERNEL_ELF)
+	@echo "BIN  $@"
+	$(OBJCOPY) -O binary $< $@
+
+# Assemble bootloader
+$(BUILD_DIR)/mbr.bin: $(BOOT_DIR)/mbr.asm
+	@echo "ASM  $<"
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+	$(AS) -f bin $< -o $@
+
+$(BUILD_DIR)/stage2.bin: $(BOOT_DIR)/stage2.asm
+	@echo "ASM  $<"
+	@if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
+	$(AS) -f bin $(NASM_MODE13H_FLAGS) $(NASM_TEXT_FLAGS) $< -o $@
+
+# Create disk image
+# Use FLOPPY=1 to create pure floppy image (no partition table)
+FLOPPY ?= 0
+ifeq ($(FLOPPY),1)
+  FLOPPY_FLAG = --floppy
+else
+  FLOPPY_FLAG =
+endif
+
+$(DISK_IMG): $(BUILD_DIR)/mbr.bin $(BUILD_DIR)/stage2.bin $(KERNEL_BIN)
+	@echo "IMG  $@"
+	python tools/create_universal_image.py $(FLOPPY_FLAG) $(BUILD_DIR)/mbr.bin $(BUILD_DIR)/stage2.bin $(KERNEL_BIN) $(DISK_IMG)
+
+# Transpile SMB (High Level)
+$(SMB_DIR)/smb_high.cpp: $(SMB_DIR)/../SMBASM/smb.lst
+	@echo "GEN  $@"
+	python tools/lifter.py $(SMB_DIR)/../SMBASM/smb.lst -o $@ --target cpp-high
+
+# Generate Data
+$(SMB_DIR)/smb_data.cpp: $(SMB_DIR)/../SMBASM/smb.chr
+	@echo "GEN  $@"
+	python tools/bin2c.py $(SMB_DIR)/../SMBASM/smb.chr $(SMB_DIR)/smb_data.cpp --name chr_rom --ns SMB
+
+# =============================================================================
+# Run Targets
+# =============================================================================
+
+run: all
+	$(QEMU) -drive format=raw,file=$(DISK_IMG) -m 16M -cpu pentium3 -serial stdio
+
+debug: all
+	$(QEMU) -drive format=raw,file=$(DISK_IMG) -m 16M -cpu pentium3 -serial stdio -s -S -d int,cpu_reset,guest_errors -D qemu.log
+
+# Test compile only (no link)
+test-compile: dirs
+	$(CXX) $(CXXFLAGS) -I$(KERNEL_DIR) -c $(KERNEL_DIR)/kernel_main.cpp -o $(BUILD_DIR)/kernel_main.o
+	@echo "Compilation test passed!"
+
+# Scaled mode (512x480 with letterboxing)
+run-scaled:
+	$(MAKE) -f Makefile.rewrite SCALE_2X=1 clean all run
+
+# Mode 13h (320x200) for testing VGA fallback
+run-mode13h:
+	$(MAKE) -f Makefile.rewrite FORCE_MODE13H=1 clean all run
+
+# Floppy image (no partition table, for 486 BIOS compatibility)
+floppy:
+	$(MAKE) -f Makefile.rewrite FLOPPY=1 FORCE_MODE13H=1 clean all
+	@echo "Floppy image created: $(DISK_IMG)"
+
