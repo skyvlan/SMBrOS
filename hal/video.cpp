@@ -611,8 +611,50 @@ void ppu_render_frame(u32 *buffer_unused) {
   // Then: render in-front-of-BG sprites (priority bit = 0)
   renderSprites(false);
 
-  // Clear dirty flags for next frame
+  // Clear dirty flags, then mark tiles under sprites as dirty for NEXT frame.
+  // This ensures the background is restored where sprites were drawn,
+  // preventing ghosting when sprites move to new positions.
   clear_dirty_flags();
+
+  // Mark tiles under active sprites as dirty for next frame
+  for (int i = 0; i < 64; i++) {
+    u8 sy = ppu.oam[i * 4];
+    if (sy >= 0xEF) continue;
+    u8 sx = ppu.oam[i * 4 + 3];
+    if (sx >= 0xF9) continue;
+    sy++; // NES sprite Y is 1 scanline early
+
+    // Each 8x8 sprite can overlap up to 2x2 tiles
+    int top_ty = sy / 8;
+    int bot_ty = (sy + 7) / 8;
+
+    for (int ty = top_ty; ty <= bot_ty && ty < 30; ty++) {
+      if (ty < 0) continue;
+
+      if (ty < 4) {
+        // Status bar tiles (no scroll)
+        int left_tx = sx / 8;
+        int right_tx = (sx + 7) / 8;
+        for (int tx = left_tx; tx <= right_tx && tx < 32; tx++) {
+          if (tx >= 0) dirty_tiles[0][ty * 32 + tx] = 1;
+        }
+      } else {
+        // Gameplay area tiles (with scroll offset)
+        int abs_left = sx + scrollX;
+        int abs_right = sx + 7 + scrollX;
+        int left_tx = abs_left / 8;
+        int right_tx = abs_right / 8;
+        for (int tx = left_tx; tx <= right_tx; tx++) {
+          int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
+          int local_x = tx & 0x1F;
+          int idx = ty * 32 + local_x;
+          if (idx >= 0 && idx < 32 * 30) {
+            dirty_tiles[nt][idx] = 1;
+          }
+        }
+      }
+    }
+  }
 }
 
 void video_init() {
