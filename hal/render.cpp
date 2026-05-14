@@ -6,8 +6,6 @@ extern "C" volatile u32 g_tick_count;
 
 namespace HAL {
 
-// Expose draw_sprites_to_vram from video.cpp
-void draw_sprites_to_vram(u8* vram, int start_x, int crop_top);
 int get_scroll_x(); // Let's add this to video.cpp
 
 struct BootInfo {
@@ -136,8 +134,5 @@ void render() {
         );
     }
   }
-
-  // Draw sprites directly to VRAM
-  draw_sprites_to_vram(vram, start_x, crop_top);
 }
 } // namespace HAL

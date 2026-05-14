@@ -303,6 +303,7 @@ static void decode_all_tiles(const u8 *chr) {
 // NES has 2 nametables of 32x30 tiles each
 static u8 dirty_tiles[2][32 * 30];  // 0 = clean, 1 = dirty
 static bool all_tiles_dirty = true; // Force full redraw on first frame
+static u8 last_bg_color = 0xFF;     // Track background palette changes
 
 // Mark a tile as dirty (called from ppu_mem_write)
 static void mark_tile_dirty(u16 addr) {
@@ -450,10 +451,17 @@ void ppu_render_frame(u32 *buffer_unused) {
     }
   };
 
+  // Detect background palette changes
+  u8 bg_color = ppu.palette[0] & 0x3F;
+  if (bg_color != last_bg_color) {
+    last_bg_color = bg_color;
+    all_tiles_dirty = true;
+    memset(dirty_tiles, 1, sizeof(dirty_tiles));
+  }
+
   // Pre-fill buffer with background color on full redraw
-  u8 bg_color_fill = ppu.palette[0] & 0x3F;
   if (all_tiles_dirty) {
-    memset(dst, bg_color_fill, 512 * 240);
+    memset(dst, bg_color, 512 * 240);
   }
 
   // ============================================
@@ -495,18 +503,13 @@ void ppu_render_frame(u32 *buffer_unused) {
     }
   }
 
-  // Clear dirty flags for next frame
-  clear_dirty_flags();
-}
-
-void draw_sprites_to_vram(u8* vram, int start_x, int crop_top) {
-  if (!(ppu.mask & 0x10)) return; // Sprites disabled
-
-  u16 spr_pattern_base = (ppu.ctrl & 0x08) ? 0x1000 : 0x0000;
-  u8 bg_color = ppu.palette[0] & 0x3F;
-  int scrollX = get_scroll_x();
-
+  // ============================================
+  // Render Sprites into internal_buffer (Double Buffering)
+  // ============================================
   auto renderSpritesPass = [&](bool behind_bg) {
+    if (!(ppu.mask & 0x10)) return; // Sprites disabled
+    u16 spr_pattern_base = (ppu.ctrl & 0x08) ? 0x1000 : 0x0000;
+
     for (int i = 63; i >= 0; i--) {
       u8 spr_y = ppu.oam[i * 4 + 0];
       if (spr_y >= 0xEF) continue;
@@ -531,32 +534,28 @@ void draw_sprites_to_vram(u8* vram, int start_x, int crop_top) {
       for (int row = 0; row < 8; row++) {
         int yOffset = flip_y ? (7 - row) : row;
         int screen_y = spr_y + yOffset;
-        
-        if (screen_y < crop_top || screen_y >= crop_top + 200) continue;
-        int vram_y = screen_y - crop_top;
+        if (screen_y < 0 || screen_y >= 240) continue;
 
         const u8 *src_row = &decoded[row * 8];
 
         for (int col = 0; col < 8; col++) {
           int xOffset = flip_x ? (7 - col) : col;
           int screen_x = spr_x + xOffset;
-          
           if (screen_x < 0 || screen_x >= 256) continue;
           
           u8 color_idx = src_row[col];
           if (color_idx == 0) continue;
 
-          // Priority check using internal buffer
-          if (behind_bg) {
-             int abs_x = screen_x;
-             if (screen_y >= 32) {
-                 abs_x = (screen_x + scrollX) & 0x1FF;
-             }
-             if (internal_buffer[screen_y * 512 + abs_x] != bg_color) continue;
+          // Calculate absolute coordinate in 512-wide buffer
+          int abs_x = screen_x;
+          if (screen_y >= 32) {
+             abs_x = (screen_x + scrollX) & 0x1FF;
           }
+          int pixel_idx = screen_y * 512 + abs_x;
 
-          // Write directly to VRAM
-          vram[vram_y * 320 + start_x + screen_x] = spr_pal[color_idx] & 0x3F;
+          if (behind_bg && dst[pixel_idx] != bg_color) continue;
+
+          dst[pixel_idx] = spr_pal[color_idx] & 0x3F;
         }
       }
     }
@@ -564,6 +563,53 @@ void draw_sprites_to_vram(u8* vram, int start_x, int crop_top) {
 
   renderSpritesPass(true);
   renderSpritesPass(false);
+
+  // Clear dirty flags, then mark tiles under sprites as dirty for NEXT frame.
+  clear_dirty_flags();
+
+  // Mark tiles under active sprites as dirty for next frame
+  if (ppu.mask & 0x10) {
+    for (int i = 0; i < 64; i++) {
+      u8 sy = ppu.oam[i * 4];
+      if (sy >= 0xEF) continue;
+      u8 sx = ppu.oam[i * 4 + 3];
+      if (sx >= 0xF9) continue;
+      sy++;
+
+      int top_ty = sy / 8;
+      int bot_ty = (sy + 7) / 8;
+
+      for (int ty = top_ty; ty <= bot_ty && ty < 30; ty++) {
+        if (ty < 0) continue;
+
+        if (ty < 4) {
+          int left_tx = sx / 8;
+          int right_tx = (sx + 7) / 8;
+          for (int tx = left_tx; tx <= right_tx && tx < 32; tx++) {
+            if (tx >= 0) dirty_tiles[0][ty * 32 + tx] = 1;
+          }
+        } else {
+          int abs_left = (sx + scrollX) & 0x1FF;
+          int abs_right = (sx + 7 + scrollX) & 0x1FF;
+          int left_tx = abs_left / 8;
+          int right_tx = abs_right / 8;
+          
+          // Handle wrap-around for dirty marking
+          if (right_tx < left_tx) right_tx += 64;
+          
+          for (int tx = left_tx; tx <= right_tx; tx++) {
+            int wrapped_tx = tx & 0x3F;
+            int nt = (wrapped_tx < 32) ? 0 : 1;
+            int local_x = wrapped_tx & 0x1F;
+            int idx = ty * 32 + local_x;
+            if (idx >= 0 && idx < 32 * 30) {
+              dirty_tiles[nt][idx] = 1;
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 void video_init() {
