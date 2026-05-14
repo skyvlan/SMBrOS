@@ -451,10 +451,17 @@ void ppu_render_frame(u32 *buffer_unused) {
   // Detect scroll changes - force full redraw if scroll moved
   // ============================================
   u8 current_scroll = (u8)scrollX;
-  if (current_scroll != last_scroll_x || all_tiles_dirty) {
+  if (current_scroll != last_scroll_x) {
     last_scroll_x = current_scroll;
-    // Scroll changed - must redraw everything
-    // (A smarter approach would shift the buffer and only render new tiles)
+    // Scroll changed - mark all tiles dirty for full redraw
+    memset(dirty_tiles, 1, sizeof(dirty_tiles));
+    all_tiles_dirty = true;
+  }
+
+  // Pre-fill buffer with background color on full redraw
+  u8 bg_color_fill = ppu.palette[0] & 0x3F;
+  if (all_tiles_dirty) {
+    memset(dst, bg_color_fill, 256 * 240);
   }
 
   // ============================================
@@ -462,6 +469,10 @@ void ppu_render_frame(u32 *buffer_unused) {
   // ============================================
   for (int tile_y = 0; tile_y < 4; tile_y++) {
     for (int tile_x = 0; tile_x < 32; tile_x++) {
+      // Skip clean tiles
+      int idx = tile_y * 32 + tile_x;
+      if (!all_tiles_dirty && !dirty_tiles[0][idx]) continue;
+
       u16 nt_addr = 0x2000 + tile_y * 32 + tile_x;
       renderTileAt(nt_addr, tile_x * 8, tile_y * 8);
     }
@@ -475,6 +486,12 @@ void ppu_render_frame(u32 *buffer_unused) {
 
   for (int x = xMin; x <= xMax; x++) {
     for (int tile_y = 4; tile_y < 30; tile_y++) {
+      // Skip clean tiles
+      int nt = (x < 32) ? 0 : 1;
+      int local_x = x & 0x1F;
+      int idx = tile_y * 32 + local_x;
+      if (!all_tiles_dirty && !dirty_tiles[nt][idx]) continue;
+
       // Determine nametable based on x position
       u16 nt_addr;
       if (x < 32) {
@@ -502,7 +519,10 @@ void ppu_render_frame(u32 *buffer_unused) {
     u16 spr_pattern_base = (ppu.ctrl & 0x08) ? 0x1000 : 0x0000;
 
     for (int i = 63; i >= 0; i--) {
+      // Skip inactive sprites early (before reading other OAM bytes)
       u8 spr_y = ppu.oam[i * 4 + 0];
+      if (spr_y >= 0xEF) continue;
+
       u8 tile_id = ppu.oam[i * 4 + 1];
       u8 attr = ppu.oam[i * 4 + 2];
       u8 spr_x = ppu.oam[i * 4 + 3];
@@ -512,8 +532,8 @@ void ppu_render_frame(u32 *buffer_unused) {
       if (has_priority != behind_bg)
         continue;
 
-      // Skip sprites off-screen
-      if (spr_y >= 0xEF || spr_x >= 0xF9)
+      // Skip sprites off-screen horizontally
+      if (spr_x >= 0xF9)
         continue;
 
       // Sprite Y is 1 scanline early
