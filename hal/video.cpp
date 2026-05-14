@@ -303,7 +303,7 @@ static void decode_all_tiles(const u8 *chr) {
 // NES has 2 nametables of 32x30 tiles each
 static u8 dirty_tiles[2][32 * 30];  // 0 = clean, 1 = dirty
 static bool all_tiles_dirty = true; // Force full redraw on first frame
-static u8 last_scroll_x = 0;        // Track scroll changes
+static int last_scroll_x = 0;       // Track full 0-511 scroll position
 
 // Mark a tile as dirty (called from ppu_mem_write)
 static void mark_tile_dirty(u16 addr) {
@@ -448,14 +448,64 @@ void ppu_render_frame(u32 *buffer_unused) {
   };
 
   // ============================================
-  // Detect scroll changes - force full redraw if scroll moved
+  // Detect scroll changes - shift buffer and force redraw of new edge
   // ============================================
-  u8 current_scroll = (u8)scrollX;
+  int current_scroll = scrollX;
   if (current_scroll != last_scroll_x) {
+    int delta = current_scroll - last_scroll_x;
+    
+    // Handle nametable wrap-around (511 -> 0 or 0 -> 511)
+    if (delta < -256) delta += 512;
+    else if (delta > 256) delta -= 512;
+    
     last_scroll_x = current_scroll;
-    // Scroll changed - mark all tiles dirty for full redraw
-    memset(dirty_tiles, 1, sizeof(dirty_tiles));
-    all_tiles_dirty = true;
+
+    if (!all_tiles_dirty && delta > 0 && delta <= 8) {
+      // Scrolled right. Shift buffer left.
+      for (int y = 32; y < 240; y++) {
+        memmove(&dst[y * 256], &dst[y * 256 + delta], 256 - delta);
+      }
+      
+      // Mark newly exposed right edge tiles as dirty
+      int right_edge_start = current_scroll + 256 - delta;
+      int right_edge_end = current_scroll + 255;
+      
+      int start_tx = right_edge_start / 8;
+      int end_tx = right_edge_end / 8;
+      
+      for (int tx = start_tx; tx <= end_tx; tx++) {
+        int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
+        int local_x = tx & 0x1F;
+        for (int ty = 4; ty < 30; ty++) {
+          dirty_tiles[nt][ty * 32 + local_x] = 1;
+        }
+      }
+    } else if (!all_tiles_dirty && delta < 0 && delta >= -8) {
+      // Scrolled left. Shift buffer right.
+      int shift = -delta;
+      for (int y = 32; y < 240; y++) {
+        memmove(&dst[y * 256 + shift], &dst[y * 256], 256 - shift);
+      }
+      
+      // Mark newly exposed left edge tiles as dirty
+      int left_edge_start = current_scroll;
+      int left_edge_end = current_scroll + shift - 1;
+      
+      int start_tx = left_edge_start / 8;
+      int end_tx = left_edge_end / 8;
+      
+      for (int tx = start_tx; tx <= end_tx; tx++) {
+        int nt = (tx < 32) ? 0 : ((tx < 64) ? 1 : 0);
+        int local_x = tx & 0x1F;
+        for (int ty = 4; ty < 30; ty++) {
+          dirty_tiles[nt][ty * 32 + local_x] = 1;
+        }
+      }
+    } else {
+      // Scroll delta too large - redraw everything
+      memset(dirty_tiles, 1, sizeof(dirty_tiles));
+      all_tiles_dirty = true;
+    }
   }
 
   // Pre-fill buffer with background color on full redraw
