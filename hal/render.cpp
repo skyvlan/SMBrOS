@@ -93,13 +93,7 @@ void render() {
   for (int y = crop_top; y < 32; y++) {
     void *src_row = (void *)&src[y * 512 + 0]; // Always read from x=0
     void *dst_row = (void *)&vram[(y - crop_top) * bpl + start_x];
-    u32 dwords = 64; // 256 / 4 = 64 DWORDs
-    asm volatile(
-        "rep movsl"
-        : "+D"(dst_row), "+S"(src_row), "+c"(dwords)
-        :
-        : "memory"
-    );
+    memcpy(dst_row, src_row, 256);
   }
 
   // Gameplay Area (Rows 4-29, which is y=32 to 239 in buffer)
@@ -115,23 +109,15 @@ void render() {
         // Copy end of nametable 1
         void *src1 = &src[y * 512 + scrollX];
         void *dst1 = dst_row;
-        u32 dwords1 = width1 / 4;
-        asm volatile("rep movsl" : "+D"(dst1), "+S"(src1), "+c"(dwords1) : : "memory");
+        memcpy(dst1, src1, width1);
         
         // Wrap to nametable 0
         void *src2 = &src[y * 512 + 0];
         void *dst2 = dst_row + width1;
-        u32 dwords2 = width2 / 4;
-        asm volatile("rep movsl" : "+D"(dst2), "+S"(src2), "+c"(dwords2) : : "memory");
+        memcpy(dst2, src2, width2);
     } else {
         void *src_row = &src[y * 512 + scrollX];
-        u32 dwords = 64;
-        asm volatile(
-            "rep movsl"
-            : "+D"(dst_row), "+S"(src_row), "+c"(dwords)
-            :
-            : "memory"
-        );
+        memcpy(dst_row, src_row, 256);
     }
   }
 }
